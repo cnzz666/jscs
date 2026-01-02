@@ -1,4 +1,4 @@
-// 即时传输 Worker - 完整实现
+// 即时传输 Worker - 修复版
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -27,18 +27,34 @@ export default {
       });
     }
     
-    // API 路由
-    if (pathname.startsWith('/api/')) {
-      return handleAPI(request, env, ctx);
+    // 健康检查
+    if (pathname === '/api/health') {
+      return Response.json({ 
+        status: 'ok', 
+        timestamp: Date.now(),
+        service: 'Instant Transfer'
+      });
     }
     
-    // 404
+    // WebSocket 连接
+    if (pathname.startsWith('/api/ws/')) {
+      return handleWebSocket(request);
+    }
+    
+    // API 路由
+    if (pathname.startsWith('/api/')) {
+      return handleAPI(request);
+    }
+    
     return new Response('Not Found', { status: 404 });
   },
 };
 
+// 房间存储（内存中，重启会丢失，但简单）
+let rooms = new Map();
+
 // API 处理器
-async function handleAPI(request, env, ctx) {
+async function handleAPI(request) {
   const url = new URL(request.url);
   const pathname = url.pathname;
   
@@ -51,15 +67,31 @@ async function handleAPI(request, env, ctx) {
         return Response.json({ error: '取件码必须是6位字符' }, { status: 400 });
       }
       
-      // 生成房间ID
-      const roomId = env.ROOMS.idFromName(code);
-      const room = env.ROOMS.get(roomId);
+      // 检查房间是否已存在
+      if (rooms.has(code)) {
+        return Response.json({ error: '房间已存在' }, { status: 409 });
+      }
       
-      // 初始化房间
-      await room.fetch('http://internal/init', {
-        method: 'POST',
-        body: JSON.stringify({ code, createdAt: Date.now() })
-      });
+      // 创建新房间
+      const room = {
+        code,
+        createdAt: Date.now(),
+        status: 'waiting',
+        sender: null,
+        receiver: null
+      };
+      
+      rooms.set(code, room);
+      
+      // 30分钟后自动清理
+      setTimeout(() => {
+        if (rooms.has(code)) {
+          const room = rooms.get(code);
+          if (room.sender) room.sender.close(1000, '房间过期');
+          if (room.receiver) room.receiver.close(1000, '房间过期');
+          rooms.delete(code);
+        }
+      }, 30 * 60 * 1000);
       
       return Response.json({ 
         success: true, 
@@ -69,7 +101,7 @@ async function handleAPI(request, env, ctx) {
       });
       
     } catch (error) {
-      return Response.json({ error: '创建失败: ' + error.message }, { status: 500 });
+      return Response.json({ error: '创建失败' }, { status: 500 });
     }
   }
   
@@ -81,284 +113,155 @@ async function handleAPI(request, env, ctx) {
       return Response.json({ error: '无效的取件码' }, { status: 400 });
     }
     
-    try {
-      const roomId = env.ROOMS.idFromName(code);
-      const room = env.ROOMS.get(roomId);
-      
-      const info = await room.fetch('http://internal/info').then(r => r.json());
-      
-      return Response.json({
-        exists: true,
-        code: info.code,
-        status: info.status,
-        createdAt: info.createdAt,
-        connections: info.connections,
-        wsUrl: `${url.origin.replace('http', 'ws')}/api/ws/${code}`
-      });
-      
-    } catch (error) {
+    const room = rooms.get(code);
+    if (!room) {
       return Response.json({ exists: false }, { status: 404 });
     }
-  }
-  
-  // WebSocket 连接
-  if (pathname.startsWith('/api/ws/')) {
-    const code = pathname.split('/').pop();
-    const role = url.searchParams.get('role');
     
-    if (!code || !role || !['sender', 'receiver'].includes(role)) {
-      return new Response('Invalid request', { status: 400 });
-    }
-    
-    // 获取房间
-    const roomId = env.ROOMS.idFromName(code);
-    const room = env.ROOMS.get(roomId);
-    
-    // 转发 WebSocket 请求
-    return room.fetch(request);
-  }
-  
-  // 健康检查
-  if (pathname === '/api/health') {
-    return Response.json({ 
-      status: 'ok', 
-      timestamp: Date.now(),
-      service: 'Instant Transfer'
+    return Response.json({
+      exists: true,
+      code: room.code,
+      status: room.status,
+      createdAt: room.createdAt,
+      connections: {
+        sender: !!room.sender,
+        receiver: !!room.receiver
+      },
+      wsUrl: `${url.origin.replace('http', 'ws')}/api/ws/${code}`
     });
   }
   
   return new Response('Not Found', { status: 404 });
 }
 
-// Durable Object 类 - 房间管理
-export class Room {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.storage = state.storage;
-    
-    // 房间状态
-    this.code = null;
-    this.status = 'waiting';
-    this.createdAt = null;
-    
-    // WebSocket 连接
-    this.sender = null;
-    this.receiver = null;
-    
-    // 心跳
-    this.lastHeartbeat = null;
+// WebSocket 处理器
+async function handleWebSocket(request) {
+  const url = new URL(request.url);
+  const code = url.pathname.split('/').pop();
+  const role = url.searchParams.get('role');
+  
+  if (!code || !role || !['sender', 'receiver'].includes(role)) {
+    return new Response('Invalid request', { status: 400 });
   }
   
-  async fetch(request) {
-    const url = new URL(request.url);
-    
-    // WebSocket 连接
-    if (request.headers.get('Upgrade') === 'websocket') {
-      return this.handleWebSocket(request);
-    }
-    
-    // 内部 API
-    if (url.pathname === '/internal/init') {
-      return this.handleInit(request);
-    } else if (url.pathname === '/internal/info') {
-      return this.handleInfo();
-    }
-    
-    return new Response('Not found', { status: 404 });
+  const room = rooms.get(code);
+  if (!room) {
+    return new Response('Room not found', { status: 404 });
   }
   
-  // 初始化房间
-  async handleInit(request) {
-    const existing = await this.storage.get('status');
-    if (existing) {
-      return new Response('Room already exists', { status: 409 });
-    }
-    
-    const { code, createdAt } = await request.json();
-    this.code = code;
-    this.createdAt = createdAt;
-    
-    await this.storage.put('code', code);
-    await this.storage.put('status', 'waiting');
-    await this.storage.put('createdAt', createdAt);
-    
-    // 设置15分钟后自动清理
-    await this.storage.setAlarm(Date.now() + 15 * 60 * 1000);
-    
-    return new Response('OK');
+  // 创建 WebSocket 对
+  const { 0: client, 1: server } = new WebSocketPair();
+  server.accept();
+  
+  // 存储连接
+  if (role === 'sender') {
+    room.sender = server;
+  } else {
+    room.receiver = server;
   }
   
-  // 获取房间信息
-  async handleInfo() {
-    const code = await this.storage.get('code');
-    const status = await this.storage.get('status');
-    const createdAt = await this.storage.get('createdAt');
-    
-    if (!code) {
-      return new Response('Room not found', { status: 404 });
-    }
-    
-    return Response.json({
-      code,
-      status: status || 'unknown',
-      createdAt: parseInt(createdAt) || Date.now(),
-      connections: {
-        sender: !!this.sender,
-        receiver: !!this.receiver
+  room.status = room.sender && room.receiver ? 'active' : 'waiting';
+  
+  // 发送连接成功消息
+  server.send(JSON.stringify({
+    type: 'connected',
+    role,
+    timestamp: Date.now()
+  }));
+  
+  // 消息处理器
+  server.addEventListener('message', (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      
+      switch (data.type) {
+        case 'file-metadata':
+          if (room.receiver) {
+            room.receiver.send(JSON.stringify({
+              type: 'file-metadata',
+              metadata: data.metadata
+            }));
+          }
+          break;
+          
+        case 'file-chunk':
+          if (room.receiver) {
+            room.receiver.send(JSON.stringify({
+              type: 'file-chunk',
+              chunk: data.chunk,
+              index: data.index,
+              total: data.total
+            }));
+          }
+          break;
+          
+        case 'transfer-complete':
+          if (room.receiver) {
+            room.receiver.send(JSON.stringify({
+              type: 'transfer-complete'
+            }));
+          }
+          break;
+          
+        case 'sender-status':
+          if (room.receiver && role === 'sender') {
+            room.receiver.send(JSON.stringify({
+              type: 'sender-status',
+              connected: data.connected,
+              timestamp: Date.now()
+            }));
+          }
+          break;
       }
-    });
-  }
+    } catch (error) {
+      console.error('消息处理错误:', error);
+    }
+  });
   
-  // 处理 WebSocket 连接
-  async handleWebSocket(request) {
-    const url = new URL(request.url);
-    const role = url.searchParams.get('role');
-    const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    // 创建 WebSocket 对
-    const { 0: client, 1: server } = new WebSocketPair();
-    
-    server.accept();
-    
-    // 设置连接
+  // 连接关闭
+  server.addEventListener('close', () => {
     if (role === 'sender') {
-      this.sender = server;
-    } else if (role === 'receiver') {
-      this.receiver = server;
+      room.sender = null;
+      if (room.receiver) {
+        room.receiver.send(JSON.stringify({
+          type: 'sender-status',
+          connected: false,
+          timestamp: Date.now()
+        }));
+      }
     } else {
-      server.close(1008, 'Invalid role');
-      return new Response(null, { status: 400 });
+      room.receiver = null;
     }
     
-    // 发送连接成功消息
-    server.send(JSON.stringify({
-      type: 'connected',
-      role,
-      clientId,
+    room.status = room.sender && room.receiver ? 'active' : 'waiting';
+    
+    // 如果双方都断开，清理房间
+    if (!room.sender && !room.receiver) {
+      setTimeout(() => {
+        if (rooms.get(code) === room) {
+          rooms.delete(code);
+        }
+      }, 60000);
+    }
+  });
+  
+  // 通知另一方
+  if (role === 'sender' && room.receiver) {
+    room.receiver.send(JSON.stringify({
+      type: 'sender-connected',
       timestamp: Date.now()
     }));
-    
-    // 设置消息处理器
-    server.addEventListener('message', (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        this.handleMessage(data, server, role);
-      } catch (error) {
-        console.error('消息处理错误:', error);
-      }
-    });
-    
-    // 连接关闭
-    server.addEventListener('close', () => {
-      if (role === 'sender') {
-        this.sender = null;
-        if (this.receiver) {
-          this.receiver.send(JSON.stringify({
-            type: 'sender-status',
-            connected: false,
-            timestamp: Date.now()
-          }));
-        }
-      } else if (role === 'receiver') {
-        this.receiver = null;
-        if (this.sender) {
-          this.sender.send(JSON.stringify({
-            type: 'receiver-status',
-            connected: false,
-            timestamp: Date.now()
-          }));
-        }
-      }
-    });
-    
-    server.addEventListener('error', (error) => {
-      console.error('WebSocket error:', error);
-    });
-    
-    // 通知另一方
-    if (role === 'sender' && this.receiver) {
-      this.receiver.send(JSON.stringify({
-        type: 'sender-connected',
-        timestamp: Date.now()
-      }));
-    } else if (role === 'receiver' && this.sender) {
-      this.sender.send(JSON.stringify({
-        type: 'receiver-connected',
-        timestamp: Date.now()
-      }));
-    }
-    
-    return new Response(null, { status: 101, webSocket: client });
+  } else if (role === 'receiver' && room.sender) {
+    room.sender.send(JSON.stringify({
+      type: 'receiver-connected',
+      timestamp: Date.now()
+    }));
   }
   
-  // 处理消息
-  handleMessage(data, socket, role) {
-    switch (data.type) {
-      case 'heartbeat':
-        this.lastHeartbeat = Date.now();
-        break;
-        
-      case 'file-metadata':
-        if (this.receiver) {
-          this.receiver.send(JSON.stringify({
-            type: 'file-metadata',
-            metadata: data.metadata,
-            timestamp: Date.now()
-          }));
-        }
-        break;
-        
-      case 'file-chunk':
-        if (this.receiver) {
-          this.receiver.send(JSON.stringify({
-            type: 'file-chunk',
-            chunk: data.chunk,
-            index: data.index,
-            total: data.total,
-            timestamp: Date.now()
-          }));
-        }
-        break;
-        
-      case 'transfer-complete':
-        if (this.receiver) {
-          this.receiver.send(JSON.stringify({
-            type: 'transfer-complete',
-            timestamp: Date.now()
-          }));
-        }
-        break;
-        
-      case 'sender-status':
-        if (this.receiver && role === 'sender') {
-          this.receiver.send(JSON.stringify({
-            type: 'sender-status',
-            connected: data.connected,
-            timestamp: Date.now()
-          }));
-        }
-        break;
-    }
-  }
-  
-  // 报警处理（房间过期）
-  async alarm() {
-    console.log(`房间 ${this.code} 已过期，正在清理`);
-    
-    if (this.sender) {
-      this.sender.close(1000, '房间过期');
-    }
-    
-    if (this.receiver) {
-      this.receiver.close(1000, '房间过期');
-    }
-    
-    await this.storage.deleteAll();
-  }
+  return new Response(null, { status: 101, webSocket: client });
 }
 
-// HTML 页面
+// HTML 页面 - 完全重写，修复点击问题
 function getHTML() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -388,10 +291,10 @@ function getHTML() {
         body {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
-            padding: 20px;
             display: flex;
             justify-content: center;
             align-items: center;
+            padding: 20px;
         }
         
         .container {
@@ -401,7 +304,7 @@ function getHTML() {
         
         .app-card {
             background: white;
-            border-radius: 20px;
+            border-radius: 24px;
             padding: 40px 30px;
             box-shadow: 0 20px 60px rgba(0, 0, 0, 0.1);
             text-align: center;
@@ -472,7 +375,6 @@ function getHTML() {
         
         .form-group {
             margin-bottom: 25px;
-            text-align: left;
         }
         
         label {
@@ -480,38 +382,64 @@ function getHTML() {
             margin-bottom: 8px;
             color: var(--dark);
             font-weight: 600;
-            font-size: 0.9rem;
+            text-align: left;
         }
         
-        .file-upload {
+        /* 修复文件选择区域 - 现在只有点击上传图标才有效 */
+        .upload-area {
             border: 2px dashed #cbd5e1;
             border-radius: 12px;
-            padding: 40px 20px;
-            text-align: center;
+            padding: 30px 20px;
             background: #f8fafc;
             cursor: pointer;
             transition: all 0.3s;
+            position: relative;
         }
         
-        .file-upload:hover {
+        .upload-area:hover {
             border-color: var(--primary);
             background: #f0f9ff;
         }
         
-        .file-upload i {
-            font-size: 2.5rem;
-            color: var(--primary);
-            margin-bottom: 10px;
+        .upload-icon {
+            width: 60px;
+            height: 60px;
+            background: var(--primary);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 15px;
+            font-size: 1.5rem;
         }
         
-        input[type="file"] {
+        .upload-text {
+            color: var(--gray);
+            margin-bottom: 5px;
+        }
+        
+        .upload-subtext {
+            font-size: 0.85rem;
+            color: #94a3b8;
+        }
+        
+        /* 文件选择按钮 - 只在图标上 */
+        #fileSelectBtn {
             position: absolute;
-            width: 100%;
-            height: 100%;
-            top: 0;
-            left: 0;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 60px;
+            height: 60px;
             opacity: 0;
             cursor: pointer;
+            z-index: 2;
+        }
+        
+        /* 隐藏默认的文件输入 */
+        #fileInput {
+            display: none;
         }
         
         .file-info {
@@ -650,7 +578,7 @@ function getHTML() {
         }
         
         .hidden {
-            display: none;
+            display: none !important;
         }
         
         .instructions {
@@ -699,9 +627,14 @@ function getHTML() {
             <div class="panel active" id="senderPanel">
                 <div class="form-group">
                     <label>选择文件</label>
-                    <div class="file-upload" id="fileUpload">
-                        <i class="fas fa-cloud-upload-alt"></i>
-                        <div>点击或拖放文件</div>
+                    <div class="upload-area" id="uploadArea">
+                        <div class="upload-icon">
+                            <i class="fas fa-cloud-upload-alt"></i>
+                        </div>
+                        <div class="upload-text">点击上方图标选择文件</div>
+                        <div class="upload-subtext">支持所有类型文件</div>
+                        <!-- 只在图标上触发文件选择 -->
+                        <button class="btn" id="fileSelectBtn" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 60px; height: 60px; opacity: 0;"></button>
                         <input type="file" id="fileInput">
                     </div>
                     <div class="file-info hidden" id="fileInfo">
@@ -710,7 +643,7 @@ function getHTML() {
                     </div>
                 </div>
                 
-                <button class="btn btn-primary" id="generateBtn">
+                <button class="btn btn-primary" id="generateBtn" disabled>
                     <i class="fas fa-barcode"></i>
                     生成取件码
                 </button>
@@ -810,6 +743,7 @@ function getHTML() {
         const receiverPanel = document.getElementById('receiverPanel');
         
         // 发送端
+        const fileSelectBtn = document.getElementById('fileSelectBtn');
         const fileInput = document.getElementById('fileInput');
         const fileInfo = document.getElementById('fileInfo');
         const fileName = document.getElementById('fileName');
@@ -875,7 +809,12 @@ function getHTML() {
             senderPanel.classList.remove('active');
         });
         
-        // 文件选择
+        // 文件选择 - 现在只在点击图标按钮时触发
+        fileSelectBtn.addEventListener('click', (e) => {
+            e.stopPropagation(); // 阻止事件冒泡
+            fileInput.click(); // 触发隐藏的文件输入
+        });
+        
         fileInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) {
                 currentFile = e.target.files[0];
@@ -908,7 +847,7 @@ function getHTML() {
                 const result = await response.json();
                 
                 if (!result.success) {
-                    throw new Error(result.error);
+                    throw new Error(result.error || '创建失败');
                 }
                 
                 codeDisplay.textContent = currentRoomCode;
@@ -917,7 +856,7 @@ function getHTML() {
                 // 连接 WebSocket
                 connectAsSender(result.wsUrl);
                 
-                showMessage('房间创建成功！', 'success');
+                showMessage('房间创建成功！请将取件码告知接收方', 'success');
                 
             } catch (error) {
                 showMessage('创建失败: ' + error.message, 'warning');
@@ -951,18 +890,23 @@ function getHTML() {
             };
             
             senderSocket.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                
-                switch (data.type) {
-                    case 'receiver-connected':
-                        // 开始发送文件
-                        sendFile();
-                        break;
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    switch (data.type) {
+                        case 'receiver-connected':
+                            // 开始发送文件
+                            sendFile();
+                            break;
+                    }
+                } catch (error) {
+                    console.error('消息解析错误:', error);
                 }
             };
             
             senderSocket.onclose = () => {
                 console.log('发送方连接关闭');
+                showMessage('连接已断开', 'warning');
             };
         }
         
@@ -989,6 +933,11 @@ function getHTML() {
             const totalChunks = Math.ceil(currentFile.size / CHUNK_SIZE);
             
             function readNext() {
+                if (senderSocket.readyState !== WebSocket.OPEN) {
+                    showMessage('连接已断开，传输失败', 'warning');
+                    return;
+                }
+                
                 const slice = currentFile.slice(offset, offset + CHUNK_SIZE);
                 reader.readAsArrayBuffer(slice);
             }
@@ -1012,6 +961,7 @@ function getHTML() {
                     setTimeout(readNext, 0);
                 } else {
                     senderSocket.send(JSON.stringify({ type: 'transfer-complete' }));
+                    showMessage('文件发送完成！', 'success');
                 }
             };
             
@@ -1020,7 +970,7 @@ function getHTML() {
         
         // 接收文件
         codeInput.addEventListener('input', function() {
-            this.value = this.value.toUpperCase();
+            this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
         });
         
         connectBtn.addEventListener('click', async () => {
@@ -1039,14 +989,14 @@ function getHTML() {
                 const result = await response.json();
                 
                 if (!result.exists) {
-                    throw new Error('房间不存在');
+                    throw new Error('房间不存在或已过期');
                 }
                 
                 // 连接 WebSocket
                 connectAsReceiver(result.wsUrl);
                 
                 receiverStatusArea.classList.add('active');
-                showMessage('连接成功！', 'success');
+                showMessage('连接成功！等待文件...', 'success');
                 
             } catch (error) {
                 showMessage('连接失败: ' + error.message, 'warning');
@@ -1059,56 +1009,73 @@ function getHTML() {
             receiverSocket = new WebSocket(wsUrl + '?role=receiver');
             let receivedChunks = [];
             let fileSize = 0;
+            let fileName = '';
             
             receiverSocket.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                
-                switch (data.type) {
-                    case 'file-metadata':
-                        fileSize = data.metadata.size;
-                        receivedChunks = [];
-                        break;
-                        
-                    case 'file-chunk':
-                        receivedChunks[data.index] = data.chunk;
-                        const received = receivedChunks.filter(Boolean).reduce((a, b) => a + b.byteLength, 0);
-                        const progress = Math.round((received / fileSize) * 100);
-                        receiverProgressFill.style.width = progress + '%';
-                        break;
-                        
-                    case 'transfer-complete':
-                        // 合并文件
-                        const blob = new Blob(receivedChunks);
-                        const url = URL.createObjectURL(blob);
-                        downloadBtn.href = url;
-                        downloadBtn.download = 'received_file';
-                        downloadBtn.classList.remove('hidden');
-                        showMessage('文件接收完成！', 'success');
-                        break;
-                        
-                    case 'sender-status':
-                        // 更新发送方状态
-                        document.querySelector('#remoteSenderStatus span').textContent = 
-                            data.connected ? '在线' : '离线';
-                        break;
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    switch (data.type) {
+                        case 'file-metadata':
+                            fileSize = data.metadata.size;
+                            fileName = data.metadata.name;
+                            receivedChunks = [];
+                            showMessage('开始接收文件: ' + fileName, 'info');
+                            break;
+                            
+                        case 'file-chunk':
+                            receivedChunks[data.index] = data.chunk;
+                            const received = receivedChunks.filter(Boolean).reduce((a, b) => a + b.byteLength, 0);
+                            const progress = Math.round((received / fileSize) * 100);
+                            receiverProgressFill.style.width = progress + '%';
+                            break;
+                            
+                        case 'transfer-complete':
+                            // 合并文件
+                            const blob = new Blob(receivedChunks);
+                            const url = URL.createObjectURL(blob);
+                            downloadBtn.href = url;
+                            downloadBtn.download = fileName || '下载的文件';
+                            downloadBtn.innerHTML = '<i class="fas fa-download"></i> 下载文件';
+                            downloadBtn.classList.remove('hidden');
+                            showMessage('文件接收完成！点击下载按钮保存', 'success');
+                            break;
+                            
+                        case 'sender-status':
+                            // 更新发送方状态
+                            document.querySelector('#remoteSenderStatus span').textContent = 
+                                data.connected ? '在线' : '离线';
+                            break;
+                            
+                        case 'sender-connected':
+                            showMessage('发送方已连接，开始传输文件...', 'success');
+                            break;
+                    }
+                } catch (error) {
+                    console.error('消息处理错误:', error);
                 }
             };
             
             receiverSocket.onclose = () => {
                 console.log('接收方连接关闭');
+                showMessage('连接已断开', 'warning');
             };
         }
         
         // 取消操作
         cancelBtn.addEventListener('click', () => {
-            if (senderSocket) senderSocket.close();
-            senderStatusArea.classList.remove('hidden');
+            if (senderSocket) {
+                senderSocket.close(1000, '用户取消');
+            }
+            senderStatusArea.classList.remove('active');
             generateBtn.disabled = false;
             generateBtn.innerHTML = '<i class="fas fa-barcode"></i> 生成取件码';
         });
         
         cancelReceiverBtn.addEventListener('click', () => {
-            if (receiverSocket) receiverSocket.close();
+            if (receiverSocket) {
+                receiverSocket.close(1000, '用户断开');
+            }
             receiverStatusArea.classList.remove('active');
             connectBtn.disabled = false;
             connectBtn.innerHTML = '<i class="fas fa-plug"></i> 连接房间';
@@ -1118,7 +1085,8 @@ function getHTML() {
         window.addEventListener('beforeunload', (e) => {
             if (senderSocket || receiverSocket) {
                 e.preventDefault();
-                e.returnValue = '文件传输中，确定离开？';
+                e.returnValue = '文件传输正在进行中，确定要离开吗？';
+                return e.returnValue;
             }
         });
         
