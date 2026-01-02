@@ -1,0 +1,4 @@
+name = "jscs"
+main = "worker.js"
+compatibility_date = "2025-11-22"
+keep_vars = true
